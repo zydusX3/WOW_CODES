@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GPS BLE Logger & Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 0; }
+    #map { height: 60vh; }
+    #log { height: 20vh; overflow-y: auto; background: #f4f4f4; padding: 10px; font-family: monospace; }
+    #table { height: 20vh; overflow-y: auto; background: #fff; padding: 10px; font-family: monospace; }
+    table { width: 100%; border-collapse: collapse; }
+    td, th { border: 1px solid #ccc; padding: 5px; text-align: center; }
+    button { margin: 10px; padding: 10px; font-size: 16px; }
+  </style>
+</head>
+<body>
+  <button onclick="connectBLE()">Connect to GPS BLE</button>
+  <button onclick="markCurrentLocation()">Mark Current Location</button>
+  <button onclick="toggleLogging()" id="logToggle">Start Logging</button>
+  <button onclick="exportMarkers()">Export Markers</button>
+  <div id="map"></div>
+  <div id="table"><table><thead><tr><th>#</th><th>Device (Lat, Lon)</th><th>Phone (Lat, Lon)</th><th>Distance (m)</th></tr></thead><tbody id="markerTable"></tbody></table></div>
+  <div id="log"></div>
+
+  <script>
+    let map, marker, phoneMarker;
+    let logDiv = document.getElementById("log");
+    let markerTable = document.getElementById("markerTable");
+    let currentLat = 0, currentLon = 0;
+    let phoneLat = 0, phoneLon = 0;
+    let markCount = 0;
+    let isLogging = false;
+    let logData = [];
+    let bleBuffer = "";
+    let exportData = [];
+
+    map = L.map("map").setView([0, 0], 2);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png").addTo(map);
+    marker = L.marker([0, 0], {icon: L.icon({iconUrl: 'https://unpkg.com/leaflet@1.9.3/dist/images/marker-icon.png'})}).addTo(map);
+    phoneMarker = L.circleMarker([0, 0], {radius: 6, color: 'blue'}).addTo(map);
+
+    async function connectBLE() {
+      try {
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: 'BHG' }],
+          optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
+        });
+
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
+        const characteristic = await service.getCharacteristic('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
+
+        await characteristic.startNotifications();
+        characteristic.addEventListener('characteristicvaluechanged', handleGPSData);
+        log("📶 Connected to BLE GPS device");
+
+        setInterval(() => characteristic.readValue().catch(() => {}), 10000);
+
+        if (navigator.geolocation) {
+          navigator.geolocation.watchPosition(updatePhoneLocation);
+        } else {
+          log("❌ Geolocation not supported by this browser.");
+        }
+
+      } catch (err) {
+        console.error("BLE connection error:", err);
+        log("❌ BLE error: " + err.message);
+      }
+    }
+
+    function handleGPSData(event) {
+      const value = new TextDecoder().decode(event.target.value);
+      bleBuffer += value;
+      const lines = bleBuffer.split("\n");
+      bleBuffer = lines.pop();
+
+      for (let line of lines) {
+        line = line.trim();
+        if (line.startsWith("GPS,")) {
+          const parts = line.split(",");
+          if (parts.length >= 3 && !isNaN(parseFloat(parts[1])) && !isNaN(parseFloat(parts[2]))) {
+            const lat = parseFloat(parts[1]);
+            const lon = parseFloat(parts[2]);
+            currentLat = lat;
+            currentLon = lon;
+            updateMap(lat, lon);
+            log(`📍 ${line}`);
+            if (isLogging) logData.push(`[${new Date().toISOString()}] ${line}`);
+          } else {
+            log("⚠️ Invalid parsed GPS format: " + line);
+          }
+        }
+      }
+    }
+
+    function updateMap(lat, lon) {
+      marker.setLatLng([lat, lon]);
+    }
+
+    function updatePhoneLocation(position) {
+      phoneLat = position.coords.latitude;
+      phoneLon = position.coords.longitude;
+      phoneMarker.setLatLng([phoneLat, phoneLon]);
+      phoneMarker.bindPopup(`📱 Phone Location<br>Lat: ${phoneLat.toFixed(6)}<br>Lon: ${phoneLon.toFixed(6)}`).openPopup();
+    }
+
+    function haversineDistance(lat1, lon1, lat2, lon2) {
+      const toRad = deg => deg * Math.PI / 180;
+      const R = 6371e3; // meters
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+                Math.sin(dLon/2) * Math.sin(dLon/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
+
+    function markCurrentLocation() {
+      if (!currentLat || !currentLon || !phoneLat || !phoneLon) {
+        log("⚠️ No current GPS or phone location to mark.");
+        return;
+      }
+      markCount++;
+
+      const deviceLabel = `Dev#${markCount}`;
+      const phoneLabel = `Phone#${markCount}`;
+      const deviceLatLng = [currentLat, currentLon];
+      const phoneLatLng = [phoneLat, phoneLon];
+      const distance = haversineDistance(currentLat, currentLon, phoneLat, phoneLon).toFixed(2);
+
+      L.marker(deviceLatLng).addTo(map)
+        .bindPopup(`${deviceLabel}<br>Lat: ${currentLat.toFixed(6)}<br>Lon: ${currentLon.toFixed(6)}<br>Distance to Phone: ${distance} m`).openPopup();
+
+      L.circleMarker(phoneLatLng, { radius: 6, color: 'green' }).addTo(map)
+        .bindPopup(`${phoneLabel}<br>Lat: ${phoneLat.toFixed(6)}<br>Lon: ${phoneLon.toFixed(6)}<br>Distance to Device: ${distance} m`).openPopup();
+
+      const midPoint = [(currentLat + phoneLat) / 2, (currentLon + phoneLon) / 2];
+      L.polyline([deviceLatLng, phoneLatLng], { color: 'red', dashArray: '4 6' }).addTo(map);
+      L.marker(midPoint, {
+        icon: L.divIcon({ className: 'distance-label', html: `<b>${distance} m</b>`, iconSize: [60, 20] })
+      }).addTo(map);
+
+      exportData.push(`${deviceLabel} (${currentLat.toFixed(6)}, ${currentLon.toFixed(6)}), ${phoneLabel} (${phoneLat.toFixed(6)}, ${phoneLon.toFixed(6)}), Distance: ${distance} meters`);
+      markerTable.innerHTML += `<tr><td>${markCount}</td><td>${currentLat.toFixed(6)}, ${currentLon.toFixed(6)}</td><td>${phoneLat.toFixed(6)}, ${phoneLon.toFixed(6)}</td><td>${distance}</td></tr>`;
+
+      log(`📍 Marked ${deviceLabel} and ${phoneLabel} at distance ${distance} meters.`);
+    }
+
+    function exportMarkers() {
+      if (exportData.length === 0) return alert("No marker data to export.");
+      const blob = new Blob([exportData.join("\n")], { type: "text/plain" });
+      const timestamp = new Date();
+      const filename = `MarkerDistances_${timestamp.toLocaleDateString('en-GB').replace(/\//g, '')}_${timestamp.toLocaleTimeString('en-GB').replace(/:/g, '')}.log`;
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = filename;
+      link.click();
+    }
+
+    function toggleLogging() {
+      isLogging = !isLogging;
+      const logBtn = document.getElementById("logToggle");
+      logBtn.textContent = isLogging ? "Stop Logging" : "Start Logging";
+
+      if (!isLogging && logData.length > 0) {
+        const blob = new Blob([logData.join("\n")], { type: "text/plain" });
+        const timestamp = new Date();
+        const filename = `GpsLogs_${timestamp.toLocaleDateString('en-GB').replace(/\//g, '')}_${timestamp.toLocaleTimeString('en-GB').replace(/:/g, '')}.log`;
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = filename;
+        link.click();
+        logData = [];
+      }
+    }
+
+    function log(message) {
+      const p = document.createElement("div");
+      p.textContent = message;
+      logDiv.appendChild(p);
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+  </script>
+</body>
+</html>

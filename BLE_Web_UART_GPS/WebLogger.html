@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Permissions-Policy" content="serial=()">
+  <title>GPS Serial Logger & Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 0; }
+    #map { height: 70vh; }
+    #log { height: 30vh; overflow-y: auto; background: #f4f4f4; padding: 10px; font-family: monospace; }
+    button { margin: 10px; padding: 10px; font-size: 16px; }
+  </style>
+</head>
+<body>
+  <button onclick="connectSerial()">Connect to GPS Serial</button>
+  <div id="map"></div>
+  <div id="log"></div>
+
+  <script>
+    let port;
+    let map, marker;
+    let logDiv = document.getElementById("log");
+
+    // Initialize Leaflet map
+    map = L.map("map").setView([0, 0], 2);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png").addTo(map);
+    marker = L.marker([0, 0]).addTo(map);
+
+    async function connectSerial() {
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 9600 });
+
+        const decoder = new TextDecoderStream();
+        const inputDone = port.readable.pipeTo(decoder.writable);
+        const inputStream = decoder.readable;
+        const reader = inputStream.getReader();
+
+        let lineBuffer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          lineBuffer += value;
+
+          let lines = lineBuffer.split("\n");
+          lineBuffer = lines.pop();
+
+          for (let line of lines) {
+            line = line.trim();
+            if (line.startsWith("$GNRMC")) {
+              const pos = parseGNRMC(line);
+              if (pos) updateMap(pos.lat, pos.lon);
+            }
+            log(line);
+          }
+        }
+      } catch (err) {
+        console.error("Serial connection error:", err);
+        log("❌ Serial error: " + err.message);
+      }
+    }
+
+    function parseGNRMC(nmea) {
+      const parts = nmea.split(",");
+      if (parts.length < 7 || parts[2] !== "A") return null;
+
+      function toDecimal(coord, dir) {
+        if (!coord) return 0;
+        const degLen = (dir === "N" || dir === "S") ? 2 : 3;
+        const degrees = parseFloat(coord.slice(0, degLen));
+        const minutes = parseFloat(coord.slice(degLen));
+        let result = degrees + minutes / 60;
+        if (dir === "S" || dir === "W") result *= -1;
+        return result;
+      }
+
+      const lat = toDecimal(parts[3], parts[4]);
+      const lon = toDecimal(parts[5], parts[6]);
+      return { lat, lon };
+    }
+
+    function updateMap(lat, lon) {
+      marker.setLatLng([lat, lon]);
+      map.setView([lat, lon], 16);
+    }
+
+    function log(message) {
+      const p = document.createElement("div");
+      p.textContent = message;
+      logDiv.appendChild(p);
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+  </script>
+</body>
+</html>

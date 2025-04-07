@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GPS BLE Logger & Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 0; }
+    #map { height: 70vh; }
+    #log { height: 30vh; overflow-y: auto; background: #f4f4f4; padding: 10px; font-family: monospace; }
+    button { margin: 10px; padding: 10px; font-size: 16px; }
+  </style>
+</head>
+<body>
+  <button onclick="connectBLE()">Connect to GPS BLE</button>
+  <button onclick="markCurrentLocation()">Mark Current Location</button>
+  <button onclick="toggleLogging()" id="logToggle">Start Logging</button>
+  <div id="map"></div>
+  <div id="log"></div>
+
+  <script>
+    let map, marker, phoneMarker;
+    let logDiv = document.getElementById("log");
+    let currentLat = 0, currentLon = 0;
+    let markCount = 0;
+    let isLogging = false;
+    let logData = [];
+    let bleBuffer = "";
+
+    map = L.map("map").setView([0, 0], 2);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png").addTo(map);
+    marker = L.marker([0, 0], {icon: L.icon({iconUrl: 'https://unpkg.com/leaflet@1.9.3/dist/images/marker-icon.png'})}).addTo(map);
+    phoneMarker = L.circleMarker([0, 0], {radius: 6, color: 'blue'}).addTo(map);
+
+    async function connectBLE() {
+      try {
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: 'BHG' }],
+          optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
+        });
+
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
+        const characteristic = await service.getCharacteristic('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
+
+        await characteristic.startNotifications();
+        characteristic.addEventListener('characteristicvaluechanged', handleGPSData);
+        log("📶 Connected to BLE GPS device");
+
+        setInterval(() => characteristic.readValue().catch(() => {}), 10000);
+
+        if (navigator.geolocation) {
+          navigator.geolocation.watchPosition(updatePhoneLocation);
+        } else {
+          log("❌ Geolocation not supported by this browser.");
+        }
+
+      } catch (err) {
+        console.error("BLE connection error:", err);
+        log("❌ BLE error: " + err.message);
+      }
+    }
+
+    function handleGPSData(event) {
+      const value = new TextDecoder().decode(event.target.value);
+      bleBuffer += value;
+      const lines = bleBuffer.split("\n");
+      bleBuffer = lines.pop(); // retain incomplete line
+
+      for (let line of lines) {
+        line = line.trim();
+
+        // Handle parsed GPS data format: "GPS,lat,lon,speed,sats,alt"
+        if (line.startsWith("GPS,")) {
+          const parts = line.split(",");
+          if (parts.length >= 6 && !isNaN(parts[1]) && !isNaN(parts[2])) {
+            const lat = parseFloat(parts[1]);
+            const lon = parseFloat(parts[2]);
+            currentLat = lat;
+            currentLon = lon;
+            updateMap(lat, lon);
+            log(`📍 ${line}`);
+            if (isLogging) logData.push(`[${new Date().toISOString()}] ${line}`);
+            continue;
+          } else {
+            log("⚠️ Invalid parsed GPS format: " + line);
+          }
+        }
+
+        if (line.startsWith("$GNRMC")) {
+          const pos = parseGNRMC(line);
+          if (pos) {
+            console.log("✅ Parsed BLE GPS location:", pos);
+            currentLat = pos.lat;
+            currentLon = pos.lon;
+            updateMap(currentLat, currentLon);
+          } else {
+            console.warn("⚠️ Incomplete or invalid $GNRMC, skipping:", line);
+            log("❌ Bad GNRMC: " + line);
+          }
+        }
+
+        if (line.startsWith("$GNRMC") || line.startsWith("$GNGGA") || line.startsWith("$GPGBS") ||
+            line.startsWith("$GPGSV") || line.startsWith("$GLGSV") || line.startsWith("$GPTXT")) {
+          log(line);
+          if (isLogging) {
+            logData.push(`[${new Date().toISOString()}] ${line}`);
+          }
+        }
+      }
+    }
+
+    function parseGNRMC(nmea) {
+      const parts = nmea.split(",");
+      if (parts.length < 7 || parts[2] !== "A" || !parts[3] || !parts[5]) return null;
+
+      function toDecimal(coord, dir) {
+        if (!coord) return 0;
+        const degLen = (dir === "N" || dir === "S") ? 2 : 3;
+        const degrees = parseFloat(coord.slice(0, degLen));
+        const minutes = parseFloat(coord.slice(degLen));
+        let result = degrees + minutes / 60;
+        if (dir === "S" || dir === "W") result *= -1;
+        return result;
+      }
+
+      const lat = toDecimal(parts[3], parts[4]);
+      const lon = toDecimal(parts[5], parts[6]);
+      return { lat, lon };
+    }
+
+    function updateMap(lat, lon) {
+      marker.setLatLng([lat, lon]);
+      map.setView([lat, lon], 16);
+    }
+
+    function updatePhoneLocation(position) {
+      const lat = position.coords.latitude;
+      const lon = position.coords.longitude;
+      phoneMarker.setLatLng([lat, lon]);
+      phoneMarker.bindPopup(`📱 Phone Location<br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}`).openPopup();
+    }
+
+    function markCurrentLocation() {
+      if (!currentLat || !currentLon) {
+        log("⚠️ No current GPS location to mark.");
+        return;
+      }
+      markCount++;
+      const label = `Label#${markCount}`;
+      const latLng = [currentLat, currentLon];
+      L.marker(latLng).addTo(map).bindPopup(`${label}<br>Lat: ${currentLat.toFixed(6)}<br>Lon: ${currentLon.toFixed(6)}`).openPopup();
+      log(`📍 ${label} marked at ${currentLat.toFixed(6)}, ${currentLon.toFixed(6)}`);
+    }
+
+    function toggleLogging() {
+      isLogging = !isLogging;
+      const logBtn = document.getElementById("logToggle");
+      logBtn.textContent = isLogging ? "Stop Logging" : "Start Logging";
+
+      if (!isLogging && logData.length > 0) {
+        const blob = new Blob([logData.join("\n")], { type: "text/plain" });
+        const timestamp = new Date();
+        const filename = `GpsLogs_${timestamp.toLocaleDateString('en-GB').replace(/\//g, '')}_${timestamp.toLocaleTimeString('en-GB').replace(/:/g, '')}.log`;
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = filename;
+        link.click();
+        logData = [];
+      }
+    }
+
+    function log(message) {
+      const p = document.createElement("div");
+      p.textContent = message;
+      logDiv.appendChild(p);
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+  </script>
+</body>
+</html>

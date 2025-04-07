@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GPS BLE Logger & Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 0; }
+    #map { height: 50vh; }
+    #log { height: 15vh; overflow-y: auto; background: #f4f4f4; padding: 10px; font-family: monospace; }
+    #table { height: 15vh; overflow-y: auto; background: #fff; padding: 10px; font-family: monospace; }
+    #chart { height: 20vh; padding: 10px; background: #eef; }
+    table { width: 100%; border-collapse: collapse; }
+    td, th { border: 1px solid #ccc; padding: 5px; text-align: center; }
+    button { margin: 10px; padding: 10px; font-size: 16px; }
+  </style>
+</head>
+<body>
+  <button onclick="connectBLE()">Connect to GPS BLE</button>
+  <button onclick="markCurrentLocation()">Mark Current Location</button>
+  <button onclick="toggleLogging()" id="logToggle">Start Logging</button>
+  <button onclick="exportMarkers()">Export Markers</button>
+  <input type="file" id="importFile" accept=".log" onchange="importMarkers()" />
+  <div id="map"></div>
+  <div id="table">
+    <table>
+      <thead><tr><th>#</th><th>Device (Lat, Lon)</th><th>Phone (Lat, Lon)</th><th>Distance (m)</th></tr></thead>
+      <tbody id="markerTable"></tbody>
+    </table>
+  </div>
+  <div id="chart"><canvas id="distanceChart"></canvas></div>
+
+  <button onclick="toggleAnalysis()">Show Analysis</button>
+  <div id="analysisPanel" style="display:none; padding: 10px; background: #f9f9f9;">
+    <h3>📊 Analysis Tools</h3>
+    <div>
+      <h4>Label-to-Label Distance</h4>
+      <select id="pointA"></select>
+      <select id="pointB"></select>
+      <button onclick="calculateLabelDistance()">Measure</button>
+      <p id="labelDistanceResult"></p>
+    </div>
+    <div>
+      <h4>Step Distances</h4>
+      <button onclick="showStepDistances()">Calculate Steps</button>
+      <div id="stepDistanceTable"></div>
+    </div>
+    <div>
+      <h4>Path Plotter</h4>
+      <label><input type="checkbox" id="showPhonePath" onchange="plotPaths()"> Show Phone Path</label>
+      <label><input type="checkbox" id="showDevicePath" onchange="plotPaths()"> Show Device Path</label>
+    </div>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    let map, marker, phoneMarker;
+    let logDiv = document.getElementById("log");
+    let markerTable = document.getElementById("markerTable");
+    let currentLat = 0, currentLon = 0;
+    let phoneLat = 0, phoneLon = 0;
+    let markCount = 0;
+    let isLogging = false;
+    let logData = [];
+    let bleBuffer = "";
+    let exportData = [];
+    let distanceLabels = [], distanceValues = [];
+
+    const distanceChart = new Chart(document.getElementById("distanceChart").getContext("2d"), {
+      type: 'line',
+      data: {
+        labels: distanceLabels,
+        datasets: [{
+          label: 'Distance (m)',
+          data: distanceValues,
+          borderColor: 'red',
+          backgroundColor: 'rgba(255,0,0,0.1)',
+          tension: 0.1
+        }]
+      },
+      options: {
+        responsive: true,
+        scales: { x: { title: { display: true, text: 'Marker #' } }, y: { beginAtZero: true } }
+      }
+    });
+
+    map = L.map("map").setView([0, 0], 2);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png").addTo(map);
+    marker = L.marker([0, 0], {icon: L.icon({iconUrl: 'https://unpkg.com/leaflet@1.9.3/dist/images/marker-icon.png'})}).addTo(map);
+    phoneMarker = L.circleMarker([0, 0], {radius: 6, color: 'blue'}).addTo(map);
+
+    async function connectBLE() {
+      try {
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: 'BHG' }],
+          optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
+        });
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
+        const characteristic = await service.getCharacteristic('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
+
+        await characteristic.startNotifications();
+        characteristic.addEventListener('characteristicvaluechanged', handleGPSData);
+        log("📶 Connected to BLE GPS device");
+
+        setInterval(() => characteristic.readValue().catch(() => {}), 10000);
+
+        if (navigator.geolocation) {
+          navigator.geolocation.watchPosition(updatePhoneLocation);
+        } else {
+          log("❌ Geolocation not supported by this browser.");
+        }
+
+      } catch (err) {
+        console.error("BLE connection error:", err);
+        log("❌ BLE error: " + err.message);
+      }
+    }
+
+    function handleGPSData(event) {
+      const value = new TextDecoder().decode(event.target.value);
+      bleBuffer += value;
+      const lines = bleBuffer.split("\n");
+      bleBuffer = lines.pop();
+
+      for (let line of lines) {
+        line = line.trim();
+        if (line.startsWith("GPS,")) {
+          const parts = line.split(",");
+          if (parts.length >= 3 && !isNaN(parseFloat(parts[1])) && !isNaN(parseFloat(parts[2]))) {
+            const lat = parseFloat(parts[1]);
+            const lon = parseFloat(parts[2]);
+            currentLat = lat;
+            currentLon = lon;
+            updateMap(lat, lon);
+            log(`📍 ${line}`);
+            if (isLogging) logData.push(`[${new Date().toISOString()}] ${line}`);
+          } else {
+            log("⚠️ Invalid parsed GPS format: " + line);
+          }
+        }
+      }
+    }
+
+    function updateMap(lat, lon) {
+      marker.setLatLng([lat, lon]);
+    }
+
+    function updatePhoneLocation(position) {
+      phoneLat = position.coords.latitude;
+      phoneLon = position.coords.longitude;
+      phoneMarker.setLatLng([phoneLat, phoneLon]);
+      phoneMarker.bindPopup(`📱 Phone Location<br>Lat: ${phoneLat.toFixed(6)}<br>Lon: ${phoneLon.toFixed(6)}`).openPopup();
+    }
+
+    function haversineDistance(lat1, lon1, lat2, lon2) {
+      const toRad = deg => deg * Math.PI / 180;
+      const R = 6371e3; // meters
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+                Math.sin(dLon/2) * Math.sin(dLon/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
+
+    function markCurrentLocation() {
+      if (!currentLat || !currentLon || !phoneLat || !phoneLon) {
+        log("⚠️ No current GPS or phone location to mark.");
+        return;
+      }
+      markCount++;
+      const deviceLatLng = [currentLat, currentLon];
+      const phoneLatLng = [phoneLat, phoneLon];
+      const distance = haversineDistance(currentLat, currentLon, phoneLat, phoneLon).toFixed(2);
+
+      L.marker(deviceLatLng).addTo(map)
+        .bindPopup(`Dev#${markCount}<br>Lat: ${currentLat.toFixed(6)}<br>Lon: ${currentLon.toFixed(6)}<br>Distance: ${distance} m`).openPopup();
+      L.circleMarker(phoneLatLng, { radius: 6, color: 'green' }).addTo(map)
+        .bindPopup(`Phone#${markCount}<br>Lat: ${phoneLat.toFixed(6)}<br>Lon: ${phoneLon.toFixed(6)}<br>Distance: ${distance} m`).openPopup();
+      const midPoint = [(currentLat + phoneLat) / 2, (currentLon + phoneLon) / 2];
+      L.polyline([deviceLatLng, phoneLatLng], { color: 'red', dashArray: '4 6' }).addTo(map);
+      L.marker(midPoint, {
+        icon: L.divIcon({ className: 'distance-label', html: `<b>${distance} m</b>`, iconSize: [60, 20] })
+      }).addTo(map);
+
+      exportData.push(`Dev#${markCount} (${currentLat.toFixed(6)}, ${currentLon.toFixed(6)}), Phone#${markCount} (${phoneLat.toFixed(6)}, ${phoneLon.toFixed(6)}), Distance: ${distance} meters`);
+      markerCoords[`Dev#${markCount}`] = deviceLatLng;
+      markerCoords[`Phone#${markCount}`] = phoneLatLng;
+      markerTable.innerHTML += `<tr><td>${markCount}</td><td>${currentLat.toFixed(6)}, ${currentLon.toFixed(6)}</td><td>${phoneLat.toFixed(6)}, ${phoneLon.toFixed(6)}</td><td>${distance}</td></tr>`;
+
+      distanceLabels.push(`M${markCount}`);
+      distanceValues.push(distance);
+      distanceChart.update();
+    }
+
+    function exportMarkers() {
+      if (exportData.length === 0) return alert("No marker data to export.");
+      const blob = new Blob([exportData.join("\n")], { type: "text/plain" });
+      const timestamp = new Date();
+      const filename = `MarkerDistances_${timestamp.toLocaleDateString('en-GB').replace(/\//g, '')}_${timestamp.toLocaleTimeString('en-GB').replace(/:/g, '')}.log`;
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = filename;
+      link.click();
+    }
+
+    function toggleLogging() {
+      isLogging = !isLogging;
+      const logBtn = document.getElementById("logToggle");
+      logBtn.textContent = isLogging ? "Stop Logging" : "Start Logging";
+
+      if (!isLogging && logData.length > 0) {
+        const blob = new Blob([logData.join("\n")], { type: "text/plain" });
+        const timestamp = new Date();
+        const filename = `GpsLogs_${timestamp.toLocaleDateString('en-GB').replace(/\//g, '')}_${timestamp.toLocaleTimeString('en-GB').replace(/:/g, '')}.log`;
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = filename;
+        link.click();
+        logData = [];
+      }
+    }
+
+    const markerCoords = {};
+
+function toggleAnalysis() {
+  const panel = document.getElementById("analysisPanel");
+  panel.style.display = panel.style.display === "none" ? "block" : "none";
+  updateDropdowns();
+}
+
+function importMarkers() {
+  const fileInput = document.getElementById("importFile");
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = function (e) {
+    const lines = e.target.result.split("\n");
+    lines.forEach((line, i) => {
+      const match = line.match(/Dev#(\\d+) \\(([^,]+), ([^)]+)\\), Phone#\\1 \\(([^,]+), ([^)]+)\\), Distance: ([\\d.]+) meters/);
+      if (match) {
+        const idx = parseInt(match[1]);
+        const devLat = parseFloat(match[2]);
+        const devLon = parseFloat(match[3]);
+        const phoneLat = parseFloat(match[4]);
+        const phoneLon = parseFloat(match[5]);
+        const distance = parseFloat(match[6]);
+
+        markerCoords[`Dev#${idx}`] = [devLat, devLon];
+        markerCoords[`Phone#${idx}`] = [phoneLat, phoneLon];
+
+        L.marker([devLat, devLon]).addTo(map).bindPopup(`Dev#${idx}<br>${distance}m`);
+        L.circleMarker([phoneLat, phoneLon], { radius: 6, color: 'green' }).addTo(map).bindPopup(`Phone#${idx}<br>${distance}m`);
+        L.polyline([[devLat, devLon], [phoneLat, phoneLon]], { color: 'red', dashArray: '4 6' }).addTo(map);
+
+        const midPoint = [(devLat + phoneLat) / 2, (devLon + phoneLon) / 2];
+        L.marker(midPoint, {
+          icon: L.divIcon({ className: 'distance-label', html: `<b>${distance} m</b>`, iconSize: [60, 20] })
+        }).addTo(map);
+
+        exportData.push(line);
+        markerTable.innerHTML += `<tr><td>${idx}</td><td>${devLat}, ${devLon}</td><td>${phoneLat}, ${phoneLon}</td><td>${distance}</td></tr>`;
+
+        distanceLabels.push(`M${idx}`);
+        distanceValues.push(distance);
+      }
+    });
+
+    markCount = Object.keys(markerCoords).filter(k => k.startsWith('Dev#')).length;
+    distanceChart.update();
+    updateDropdowns();
+  };
+
+  reader.readAsText(file);
+}
+
+
+function calculateLabelDistance() {
+  const a = document.getElementById("pointA").value;
+  const b = document.getElementById("pointB").value;
+  if (!(a in markerCoords) || !(b in markerCoords)) {
+    document.getElementById("labelDistanceResult").innerText = "❌ Invalid selection.";
+    return;
+  }
+  const p1 = markerCoords[a];
+  const p2 = markerCoords[b];
+  const dist = haversineDistance(p1[0], p1[1], p2[0], p2[1]).toFixed(2);
+  document.getElementById("labelDistanceResult").innerText = `📏 Distance between ${a} and ${b}: ${dist} meters`;
+  L.polyline([p1, p2], { color: 'purple', dashArray: '3 6' }).addTo(map);
+}
+
+function showStepDistances() {
+  let html = '<table><tr><th>Pair</th><th>Distance (m)</th></tr>';
+  for (let i = 1; i < markCount; i++) {
+    const pd1 = markerCoords[`Phone#${i}`];
+    const pd2 = markerCoords[`Phone#${i+1}`];
+    const dd1 = markerCoords[`Dev#${i}`];
+    const dd2 = markerCoords[`Dev#${i+1}`];
+    if (pd1 && pd2) html += `<tr><td>Phone#${i}-Phone#${i+1}</td><td>${haversineDistance(...pd1, ...pd2).toFixed(2)}</td></tr>`;
+    if (dd1 && dd2) html += `<tr><td>Dev#${i}-Dev#${i+1}</td><td>${haversineDistance(...dd1, ...dd2).toFixed(2)}</td></tr>`;
+  }
+  html += '</table>';
+  document.getElementById("stepDistanceTable").innerHTML = html;
+}
+
+function plotPaths() {
+  if (window.phonePath) map.removeLayer(window.phonePath);
+  if (window.devPath) map.removeLayer(window.devPath);
+
+  if (document.getElementById("showPhonePath").checked) {
+    const points = [];
+    for (let i = 1; i <= markCount; i++) {
+      const key = `Phone#${i}`;
+      if (markerCoords[key]) points.push(markerCoords[key]);
+    }
+    window.phonePath = L.polyline(points, { color: 'blue' }).addTo(map);
+  }
+
+  if (document.getElementById("showDevicePath").checked) {
+    const points = [];
+    for (let i = 1; i <= markCount; i++) {
+      const key = `Dev#${i}`;
+      if (markerCoords[key]) points.push(markerCoords[key]);
+    }
+    window.devPath = L.polyline(points, { color: 'red' }).addTo(map);
+  }
+}
+
+function updateDropdowns() {
+  const pointA = document.getElementById("pointA");
+  const pointB = document.getElementById("pointB");
+  [pointA, pointB].forEach(sel => {
+    sel.innerHTML = "";
+    for (let i = 1; i <= markCount; i++) {
+      ["Dev#", "Phone#"].forEach(prefix => {
+        const opt = document.createElement("option");
+        opt.value = `${prefix}${i}`;
+        opt.textContent = `${prefix}${i}`;
+        sel.appendChild(opt.cloneNode(true));
+      });
+    }
+  });
+}
+
+function log(message) {
+      const p = document.createElement("div");
+      p.textContent = message;
+      logDiv.appendChild(p);
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+  </script>
+</body>
+</html>
